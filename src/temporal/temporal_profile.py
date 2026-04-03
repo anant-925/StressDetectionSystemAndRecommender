@@ -106,6 +106,9 @@ class TemporalStressProfile:
         """
         scores = self.get_scores()
         if len(scores) < 2:
+            # Default of 0.7 is a conservative clinical-literature-inspired baseline:
+            # stress scores above 70% are commonly associated with moderate-to-severe
+            # distress in validated self-report instruments (e.g. PSS-10).
             return 0.7   # sensible default until enough history
 
         mu = float(np.mean(scores))

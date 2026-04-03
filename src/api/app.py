@@ -2,16 +2,24 @@
 src/api/app.py
 
 FastAPI backend that exposes:
-  POST /predict      – single-text stress prediction + recommendations
-  GET  /profile/{uid} – temporal stress profile summary for a user
+  POST /predict           – single-text stress prediction + recommendations
+  GET  /profile/{uid}     – temporal stress profile summary for a user
   POST /profile/{uid}/add – add a new stress event for a user
+
+Response format follows the pipeline specification:
+  {
+    "status": "safe | crisis | nudge",
+    "metrics": {"stress_score": float, "velocity": str, "threshold_crossed": bool},
+    "explainability": [{"word": str, "weight": float}, ...],
+    "interventions": [{"title": str, "action": str, "body": str, "type": str}, ...]
+  }
 """
 
 from __future__ import annotations
 
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Literal, Optional
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
@@ -24,12 +32,16 @@ CHECKPOINT_PATH = REPO_ROOT / "models" / "checkpoints" / "best_model.pt"
 
 app = FastAPI(
     title="Stress Detection & Recommender API",
-    version="1.0.0",
-    description="Production-grade stress detection with temporal modelling and safety-first recommendations.",
+    version="2.0.0",
+    description=(
+        "Production-grade stress detection with temporal modelling and safety-first recommendations. "
+        "Follows a strict 4-step pipeline: Input → Circuit Breaker → ML + Temporal → Output."
+    ),
 )
 
 # ── Lazy-load inference engine ────────────────────────────────────────────────
 _inference_engine = None
+
 
 def get_inference_engine():
     global _inference_engine
@@ -50,22 +62,44 @@ _profiles: dict[str, TemporalStressProfile] = {}
 recommender = RecommendationEngine()
 
 
-# ── Schemas ───────────────────────────────────────────────────────────────────
+# ── Request / Response Schemas ────────────────────────────────────────────────
 
 class PredictRequest(BaseModel):
-    text: str = Field(..., min_length=1, max_length=10_000)
     user_id: Optional[str] = None
+    text: str = Field(..., min_length=1, max_length=10_000)
+    timestamp: Optional[str] = None     # ISO-8601 string (stored for display)
+
+
+class MetricsPayload(BaseModel):
+    stress_score: float
+    velocity: str                       # formatted with sign e.g. "+0.15"
+    threshold_crossed: bool
+
+
+class ExplainabilityToken(BaseModel):
+    word: str
+    weight: float
+
+
+class InterventionPayload(BaseModel):
+    title: str
+    action: str
+    body: str
+    type: Literal["interactive", "behavioral", "informational"]
+
+
+class EmergencyResource(BaseModel):
+    label: str
+    contact: str
+    url: Optional[str] = None
 
 
 class PredictResponse(BaseModel):
-    stress_score: float
-    tokens: list[str]
-    attn_weights: list[float]
-    layer: int
-    crisis_detected: bool
-    triggers_found: list[str]
-    recommendations: list[str]
-    emergency_resources: list[str]
+    status: Literal["safe", "crisis", "nudge"]
+    metrics: MetricsPayload
+    explainability: list[ExplainabilityToken]
+    interventions: list[InterventionPayload]
+    emergency_resources: list[EmergencyResource]
     explanation: str
     temporal_summary: Optional[dict] = None
 
@@ -80,19 +114,55 @@ class AddEventRequest(BaseModel):
 
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    return {"status": "ok", "version": "2.0.0"}
 
 
 @app.post("/predict", response_model=PredictResponse)
 def predict(req: PredictRequest):
+    """
+    4-step pipeline:
+      Step 1 – Receive text
+      Step 2 – Circuit Breaker check (Layer 1), then ML inference
+      Step 3 – Temporal context (Vs, adaptive threshold, trigger extraction)
+      Step 4 – Build and return structured response
+    """
+
+    # ── Step 2a: Circuit Breaker (runs BEFORE the heavy ML model) ─────────────
+    if recommender.circuit_breaker(req.text):
+        # Immediately return emergency payload; ML model is never called
+        from src.recommender.recommendation_engine import _EMERGENCY_RESOURCES
+        return PredictResponse(
+            status="crisis",
+            metrics=MetricsPayload(stress_score=1.0, velocity="+0.00", threshold_crossed=True),
+            explainability=[],
+            interventions=[],
+            emergency_resources=[EmergencyResource(**r) for r in _EMERGENCY_RESOURCES],
+            explanation=(
+                "Crisis signal detected. AI recommendations are paused. "
+                "Please reach out to one of the emergency resources immediately."
+            ),
+            temporal_summary=None,
+        )
+
+    # ── Step 2b: ML Inference ─────────────────────────────────────────────────
     engine = get_inference_engine()
     result = engine.predict(req.text)
     stress_score: float = result["stress_score"]
+    tokens: list[str] = result["tokens"]
+    attn_weights: list[float] = result["attn_weights"]
 
-    # Update temporal profile if user_id provided
+    # Build explainability list (word + weight, filtered to real tokens)
+    explainability = [
+        ExplainabilityToken(word=t.replace("##", ""), weight=round(w, 4))
+        for t, w in zip(tokens, attn_weights)
+        if t not in ("[PAD]", "[CLS]", "[SEP]", "<pad>")
+    ]
+
+    # ── Step 3: Temporal Context ──────────────────────────────────────────────
     temporal_summary = None
     should_intervene = False
     is_high_volatility = False
+    velocity_float = 0.0
 
     if req.user_id:
         if req.user_id not in _profiles:
@@ -107,8 +177,12 @@ def predict(req: PredictRequest):
         )
         should_intervene = profile.should_intervene()
         is_high_volatility = profile.is_high_volatility()
+        velocity_float = profile.stress_velocity()
         temporal_summary = profile.summary()
 
+    velocity_str = f"{velocity_float:+.3f}"
+
+    # ── Step 4: Recommendation Engine ────────────────────────────────────────
     reco = recommender.recommend(
         text=req.text,
         stress_score=stress_score,
@@ -116,15 +190,32 @@ def predict(req: PredictRequest):
         should_intervene=should_intervene,
     )
 
+    threshold = (
+        _profiles[req.user_id].adaptive_threshold()
+        if req.user_id and req.user_id in _profiles
+        else 0.7
+    )
+
+    interventions_payload = [
+        InterventionPayload(
+            title=i.title,
+            action=i.action,
+            body=i.body,
+            type=i.type,
+        )
+        for i in reco.interventions
+    ]
+
     return PredictResponse(
-        stress_score=stress_score,
-        tokens=result["tokens"],
-        attn_weights=result["attn_weights"],
-        layer=reco.layer,
-        crisis_detected=reco.crisis_detected,
-        triggers_found=reco.triggers_found,
-        recommendations=reco.recommendations,
-        emergency_resources=reco.emergency_resources,
+        status=reco.status,
+        metrics=MetricsPayload(
+            stress_score=round(stress_score, 4),
+            velocity=velocity_str,
+            threshold_crossed=stress_score >= threshold,
+        ),
+        explainability=explainability,
+        interventions=interventions_payload,
+        emergency_resources=[],
         explanation=reco.explanation,
         temporal_summary=temporal_summary,
     )

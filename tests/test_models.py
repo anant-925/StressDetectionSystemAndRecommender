@@ -5,13 +5,11 @@ Unit tests for:
   - sliding_window_chunks (dataset.py)
   - MultichannelCNNWithAttention forward pass (model.py)
   - TemporalStressProfile (temporal_profile.py)
-  - RecommendationEngine (recommendation_engine.py)
+  - RecommendationEngine – structured output (recommendation_engine.py)
 """
 
 from __future__ import annotations
 
-import math
-import time
 import unittest
 
 import torch
@@ -25,7 +23,8 @@ class _StubTokenizer:
     vocab_size = 1000
 
     def __call__(self, text: str, add_special_tokens: bool = True, return_tensors: str = "pt"):
-        ids = [ord(c) % 998 + 1 for c in text.split()]   # word-level, non-zero
+        # Deterministic index-based token IDs (word position → ID, guaranteed unique per vocab)
+        ids = [(i % 998) + 1 for i, _ in enumerate(text.split())]
         return {
             "input_ids": torch.tensor([ids], dtype=torch.long),
             "attention_mask": torch.ones(1, len(ids), dtype=torch.long),
@@ -170,9 +169,9 @@ class TestTemporalStressProfile(unittest.TestCase):
         self.assertLess(p.stress_velocity(), 0)
 
     def test_adaptive_threshold_above_mean(self):
+        import numpy as np
         scores = [0.3, 0.4, 0.5, 0.6, 0.7]
         p = self._make_profile(scores)
-        import numpy as np
         expected = float(np.mean(scores)) + 1.5 * float(np.std(scores, ddof=1))
         self.assertAlmostEqual(p.adaptive_threshold(), min(expected, 1.0), places=5)
 
@@ -198,10 +197,25 @@ class TestTemporalStressProfile(unittest.TestCase):
 
 
 class TestRecommendationEngine(unittest.TestCase):
+    """Tests cover both the structured output shape and the correct routing logic."""
 
     def setUp(self):
         from src.recommender.recommendation_engine import RecommendationEngine
         self.engine = RecommendationEngine()
+
+    # ── Helpers ──────────────────────────────────────────────────────────────
+
+    def _assert_intervention_shape(self, result):
+        """Every Intervention in the result must have the required fields."""
+        from src.recommender.recommendation_engine import Intervention
+        for interv in result.interventions:
+            self.assertIsInstance(interv, Intervention)
+            self.assertIn(interv.type, ("interactive", "behavioral", "informational"))
+            self.assertTrue(interv.title)
+            self.assertTrue(interv.action)
+            self.assertTrue(interv.body)
+
+    # ── Layer 1: Circuit Breaker ──────────────────────────────────────────────
 
     def test_circuit_breaker_triggers(self):
         crisis_texts = [
@@ -214,57 +228,12 @@ class TestRecommendationEngine(unittest.TestCase):
             result = self.engine.recommend(text, stress_score=0.9)
             self.assertTrue(result.crisis_detected, f"Expected crisis for: {text!r}")
             self.assertEqual(result.layer, 1)
+            self.assertEqual(result.status, "crisis")
             self.assertGreater(len(result.emergency_resources), 0)
+            self.assertEqual(result.interventions, [])
 
     def test_circuit_breaker_not_triggered_for_normal_text(self):
         result = self.engine.recommend("I feel a bit tired today", stress_score=0.5)
-        self.assertFalse(result.crisis_detected)
-
-    def test_context_matcher_sleep(self):
-        result = self.engine.recommend(
-            "I can't sleep because of insomnia and I am exhausted",
-            stress_score=0.7,
-            should_intervene=True,
-        )
-        self.assertEqual(result.layer, 2)
-        self.assertIn("sleep", result.triggers_found)
-        self.assertGreater(len(result.recommendations), 0)
-
-    def test_context_matcher_exams(self):
-        result = self.engine.recommend(
-            "My exam deadline is tomorrow and I haven't started studying",
-            stress_score=0.8,
-            should_intervene=True,
-        )
-        self.assertEqual(result.layer, 2)
-        self.assertIn("exams", result.triggers_found)
-
-    def test_context_matcher_money(self):
-        result = self.engine.recommend(
-            "I can't pay my rent and I am drowning in debt",
-            stress_score=0.75,
-            should_intervene=True,
-        )
-        self.assertEqual(result.layer, 2)
-        self.assertIn("money", result.triggers_found)
-
-    def test_preventive_nudges_high_volatility(self):
-        result = self.engine.recommend(
-            "I had a decent day overall",
-            stress_score=0.35,
-            is_high_volatility=True,
-        )
-        self.assertEqual(result.layer, 3)
-        self.assertGreater(len(result.recommendations), 0)
-
-    def test_no_intervention_needed(self):
-        result = self.engine.recommend(
-            "Had a great walk in the park, feeling good",
-            stress_score=0.1,
-            is_high_volatility=False,
-            should_intervene=False,
-        )
-        self.assertEqual(result.layer, 0)
         self.assertFalse(result.crisis_detected)
 
     def test_circuit_breaker_halts_other_layers(self):
@@ -275,6 +244,120 @@ class TestRecommendationEngine(unittest.TestCase):
         )
         self.assertTrue(result.crisis_detected)
         self.assertEqual(result.layer, 1)
+        self.assertEqual(result.status, "crisis")
+
+    # ── Layer 2: Context Matcher ──────────────────────────────────────────────
+
+    def test_context_matcher_sleep(self):
+        result = self.engine.recommend(
+            "I can't sleep because of insomnia and I am exhausted",
+            stress_score=0.7,
+            should_intervene=True,
+        )
+        self.assertEqual(result.layer, 2)
+        self.assertEqual(result.status, "nudge")
+        self.assertIn("sleep", result.triggers_found)
+        self._assert_intervention_shape(result)
+        # At least one intervention should be interactive (breathing exercise)
+        types = [i.type for i in result.interventions]
+        self.assertIn("interactive", types)
+
+    def test_context_matcher_exams(self):
+        result = self.engine.recommend(
+            "My exam deadline is tomorrow and I haven't started studying",
+            stress_score=0.8,
+            should_intervene=True,
+        )
+        self.assertEqual(result.layer, 2)
+        self.assertIn("exams", result.triggers_found)
+        self._assert_intervention_shape(result)
+
+    def test_context_matcher_money(self):
+        result = self.engine.recommend(
+            "I can't pay my rent and I am drowning in debt",
+            stress_score=0.75,
+            should_intervene=True,
+        )
+        self.assertEqual(result.layer, 2)
+        self.assertIn("money", result.triggers_found)
+        self._assert_intervention_shape(result)
+
+    def test_context_matcher_work(self):
+        result = self.engine.recommend(
+            "My boss keeps piling on more work and I'm completely overwhelmed and burned out",
+            stress_score=0.8,
+            should_intervene=True,
+        )
+        self.assertEqual(result.layer, 2)
+        self.assertIn("work", result.triggers_found)
+        self._assert_intervention_shape(result)
+
+    def test_context_matcher_relationships(self):
+        result = self.engine.recommend(
+            "I feel so lonely since the breakup and completely isolated",
+            stress_score=0.7,
+            should_intervene=True,
+        )
+        self.assertEqual(result.layer, 2)
+        self.assertIn("relationships", result.triggers_found)
+        self._assert_intervention_shape(result)
+
+    # ── Layer 3: Preventive Nudges ────────────────────────────────────────────
+
+    def test_preventive_nudges_high_volatility(self):
+        result = self.engine.recommend(
+            "I had a decent day overall",
+            stress_score=0.35,
+            is_high_volatility=True,
+        )
+        self.assertEqual(result.layer, 3)
+        self.assertEqual(result.status, "nudge")
+        self._assert_intervention_shape(result)
+
+    def test_preventive_nudges_moderate_score(self):
+        result = self.engine.recommend(
+            "Things are a bit stressful lately",
+            stress_score=0.45,
+        )
+        self.assertEqual(result.layer, 3)
+        self._assert_intervention_shape(result)
+
+    # ── Layer 0: No intervention ──────────────────────────────────────────────
+
+    def test_no_intervention_needed(self):
+        result = self.engine.recommend(
+            "Had a great walk in the park, feeling good",
+            stress_score=0.1,
+            is_high_volatility=False,
+            should_intervene=False,
+        )
+        self.assertEqual(result.layer, 0)
+        self.assertEqual(result.status, "safe")
+        self.assertFalse(result.crisis_detected)
+        # Even safe results have at least one intervention (a positive message)
+        self.assertGreater(len(result.interventions), 0)
+        self._assert_intervention_shape(result)
+
+    # ── backward-compat recommendations property ──────────────────────────────
+
+    def test_recommendations_property_is_list_of_strings(self):
+        result = self.engine.recommend(
+            "I can't sleep and I'm stressed about my exam",
+            stress_score=0.7,
+            should_intervene=True,
+        )
+        recs = result.recommendations
+        self.assertIsInstance(recs, list)
+        for r in recs:
+            self.assertIsInstance(r, str)
+
+    # ── Emergency resources shape ─────────────────────────────────────────────
+
+    def test_emergency_resources_have_required_keys(self):
+        result = self.engine.recommend("I want to end my life", stress_score=1.0)
+        for resource in result.emergency_resources:
+            self.assertIn("label", resource)
+            self.assertIn("contact", resource)
 
 
 if __name__ == "__main__":

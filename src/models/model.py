@@ -52,8 +52,8 @@ class ConvBranch(nn.Module):
 
     def __init__(self, in_channels: int, num_filters: int, kernel_size: int) -> None:
         super().__init__()
-        padding = kernel_size // 2  # 'same' padding to preserve sequence length
-        self.conv = nn.Conv1d(in_channels, num_filters, kernel_size, padding=padding)
+        # padding='same' ensures output length == input length for any kernel size
+        self.conv = nn.Conv1d(in_channels, num_filters, kernel_size, padding="same")
         self.attention = AttentionLayer(num_filters)
 
     def forward(
