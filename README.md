@@ -75,4 +75,3 @@ Emotions NLP Dataset: Used to profile distinct underlying emotions (fear, anger,
 
 🚀 Future Roadmap & Usage
 
-This README represents the end-state of the project blueprint. Setup scripts and API endpoints will be added as the phased implementation progresses.
